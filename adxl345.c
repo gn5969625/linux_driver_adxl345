@@ -42,15 +42,24 @@ static const int adxl345_scale_table [][2] = {
 	{0,38358},{0,38339},{0,38330},{0,38325}
 };
 
+//for non-lowpower mode
 static const struct {
         int val;
         int val2;
 } adxl345_samp_freq_table[] = {
-        {3200, 0}, {1800, 0}, {800, 0}, {400, 0}, {200, 0}, {100, 0}, {50, 0}, {25, 0},
-        {12, 500000}, {6, 250000}
+	{0, 100000},{0, 200000},{0, 390000},{0, 780000},{1, 560000},{3, 130000},{6, 250000},{12, 500000},{25, 0},{50, 0},{100, 0},{200, 0},{400, 0},{800, 0},{1600, 0},{3200, 0}
 };
+//for lowerpower mode,we just don't support low-pwower mode
+static const struct {
+        int val;
+        int val2;
+} adxl345_lowpower_samp_freq_table[] = {
+        {12, 500000},{25, 0},{50, 0},{100, 0},{200, 0},{400, 0}
+};
+
 static IIO_CONST_ATTR(in_accel_scale_available, ADXL345_SCALE_AVAIL);
-static IIO_CONST_ATTR_SAMP_FREQ_AVAIL("6.25 12.5 25 50 100 200 400 800 1600 3200");
+//static IIO_CONST_ATTR_SAMP_FREQ_AVAIL("12.5 25 50 100 200 400"); //low-power mode
+static IIO_CONST_ATTR_SAMP_FREQ_AVAIL("0.10 0.20 0.39 0.78 1.56 3.13 6.25 12.5 25 50 100 200 400 800 1600 3200");
 static struct attribute *adxl345_attributes[] = {
         &iio_const_attr_in_accel_scale_available.dev_attr.attr,
         &iio_const_attr_sampling_frequency_available.dev_attr.attr,
@@ -63,6 +72,9 @@ static const struct attribute_group adxl345_attribute_group = {
 struct adxl345_data {
 	struct i2c_client *client;
 	struct mutex lock;
+	u8 mode;
+	u8 sample_rate_idx;
+	u8 range;
 };
 //just for debug test
 static struct i2c_client *adxl345_client;
@@ -108,6 +120,59 @@ static struct attribute_group adxl345_attr_group = {
     .name = "adxl345_sysfs",
     .attrs = adxl345_attrs,
 };
+//Register 0x2D—POWER_CTL (Read/Write):format
+//D7 D6 D5      D4        D3     D2   [D1 D0]
+//0  0 Link AUTO_SLEEP Measure Sleep  Wakeup
+//set D3 0 enter to standby mode
+static int adxl345_set_mode(struct adxl345_data *data, u8 mode) {
+	int ret;
+	struct i2c_client *client = data->client;
+	ret = i2c_smbus_write_byte_data(client, ADXL345_REG_POWER_CTL, mode);
+	data->mode = mode;
+	return ret;
+}
+//set Register 0x2C—BW_RATE (Read/Write):format
+//D7 D6 D5  D4            [D3 D2 D1 D0]
+//0  0  0   LOW_POWER     Rate
+static int adxl345_set_sample_rate(struct adxl345_data *data, u8 rate) {
+	int ret;
+	struct i2c_client *client = data->client;
+	u8 mode;
+	u8 masked_reg;
+	mode = data->mode;
+	//enter standby mode
+	ret = i2c_smbus_write_byte_data(client, ADXL345_REG_POWER_CTL, 0);
+	//read BW_RATE register and set new rate
+	ret = i2c_smbus_read_byte_data(client, ADXL345_REG_BW_RATE);
+	masked_reg = (ret & ~(0xf)) | rate;
+
+	ret = i2c_smbus_write_byte_data(client, ADXL345_REG_BW_RATE, masked_reg);
+	data->sample_rate_idx = rate;
+	adxl345_set_mode(data,mode);
+	return ret;
+}
+//Register 0x31—DATA_FORMAT (Read/Write):format
+//D7        D6  D5         D4 D3       D2      [D1 D0]
+//SELF_TEST SPI INT_INVERT 0  FULL_RES Justify Range 
+static int adxl345_set_range(struct adxl345_data *data, u8 range) {
+	int ret;
+	struct i2c_client *client = data->client;
+	u8 mode;
+	u8 masked_reg;
+	mode = data->mode;
+	//enter standby mode
+	ret = i2c_smbus_write_byte_data(client, ADXL345_REG_POWER_CTL, 0);
+
+	//read DATA_FORMAT register and set new range
+	ret = i2c_smbus_read_byte_data(client, ADXL345_REG_DATA_FORMAT);
+	masked_reg = (ret & ~(0x3)) | range;
+
+	ret = i2c_smbus_write_byte_data(client, ADXL345_REG_DATA_FORMAT, masked_reg);
+	data->range = range;
+
+	adxl345_set_mode(data,mode);
+	return ret;
+}
 
 static int adxl345_read_accel(struct adxl345_data *data,u8 address) {
 	int ret;
@@ -129,13 +194,13 @@ static int adxl345_read_raw(struct iio_dev *indio_dev, struct iio_chan_spec cons
 		return IIO_VAL_INT;
 	case IIO_CHAN_INFO_SCALE:
 		//temporary hardcode set,because our init
-		*val = adxl345_scale_table[3][0];
-		*val2 = adxl345_scale_table[3][1];	
+		*val = adxl345_scale_table[data->range][0];
+		*val2 = adxl345_scale_table[data->range][1];	
 		return IIO_VAL_INT_PLUS_MICRO;
 	case IIO_CHAN_INFO_SAMP_FREQ:
 		//temporary hardcode set,device default ,ref datasheet page 25/40 for Register 0x2C
-		*val = adxl345_samp_freq_table[5].val;
-		*val2 = adxl345_samp_freq_table[5].val2;
+		*val = adxl345_samp_freq_table[data->sample_rate_idx].val;
+		*val2 = adxl345_samp_freq_table[data->sample_rate_idx].val2;
 		return IIO_VAL_INT_PLUS_MICRO;
 	}
 	return -EINVAL;
@@ -160,7 +225,8 @@ static int adxl345_write_raw(struct iio_dev *indio_dev, struct iio_chan_spec con
 
 		mutex_lock(&data->lock);
 		//temporary no operation
-		ret = 1;
+		ret = adxl345_set_range(data, index);
+		//ret = 1;
 		mutex_unlock(&data->lock);
 		return ret;
 	case IIO_CHAN_INFO_SAMP_FREQ:
@@ -176,7 +242,8 @@ static int adxl345_write_raw(struct iio_dev *indio_dev, struct iio_chan_spec con
                 	return -EINVAL;
 		mutex_lock(&data->lock);
 		//temporary no operation
-		ret = 1;
+		ret = adxl345_set_sample_rate(data, index);
+		//ret = 1;
                 mutex_unlock(&data->lock);
 		return ret;
 
@@ -197,14 +264,20 @@ static const struct iio_info adxl345_info = {
 };
 
 
-static int adxl345_dev_init(void)
+static int adxl345_dev_init(struct iio_dev *indio_dev)
 {
 	unsigned char res;
+	struct adxl345_data *data = iio_priv(indio_dev);
+	mutex_lock(&data->lock);
 	printk("%s called\n", __func__);
-	res = i2c_smbus_write_byte_data(adxl345_client, ADXL345_REG_DATA_FORMAT, 0x0B); //+-16g,13 bit mode
-	res = i2c_smbus_write_byte_data(adxl345_client, ADXL345_REG_POWER_CTL, 0x08); //start measurement
-	res = i2c_smbus_write_byte_data(adxl345_client, ADXL345_REG_INT_ENABLE, 0x80); //enable data_ready interrupt
-	res = i2c_smbus_read_byte_data(adxl345_client, ADXL345_REG_DEVID); //adxl345 device id
+	res = i2c_smbus_write_byte_data(data->client, ADXL345_REG_DATA_FORMAT, 0x0B); //+-16g,13 bit mode,default
+	res = i2c_smbus_write_byte_data(data->client, ADXL345_REG_POWER_CTL, 0x08); //start measurement
+	res = i2c_smbus_write_byte_data(data->client, ADXL345_REG_INT_ENABLE, 0x80); //enable data_ready interrupt
+	data->mode = 0x08;
+        data->sample_rate_idx = 10; //default 100Hz,BW_RATE is 0x0A = 10
+        data->range = 3;
+	res = i2c_smbus_read_byte_data(data->client, ADXL345_REG_DEVID); //adxl345 device id
+	mutex_unlock(&data->lock);
 	if( res == ADXL345_DEVICE_ID) {
 		printk("init adxl345 is ok and device id is %x\n",res);
 	} 
@@ -238,7 +311,7 @@ static int adxl345_probe(struct i2c_client *i2c, const struct i2c_device_id *id)
 	mutex_init(&test_lock);
 	adxl345_client = i2c;
 	//
-	adxl345_dev_init();
+	adxl345_dev_init(indio_dev);
 	printk("adxl345 device component found!~\n");
 	ret = sysfs_create_group(&i2c->dev.kobj, &adxl345_attr_group);
 	ret = iio_device_register(indio_dev);
